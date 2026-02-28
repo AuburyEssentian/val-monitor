@@ -1,0 +1,19 @@
+{
+  "name": "val-monitor",
+  "bin": {
+    "val-monitor": "./index.ts"
+  },
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "chalk": "4",
+    "commander": "^14.0.3"
+  }
+}
