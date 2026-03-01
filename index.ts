@@ -17,6 +17,7 @@
  *   val-monitor watch                   # continuous monitoring with alerts
  *   val-monitor watch --webhook <url>   # post alerts to Discord webhook
  *   val-monitor missed [--epoch N]      # check for missed attestations last epoch
+ *   val-monitor performance [--epochs N] # attestation rate over last N epochs (default 10)
  */
 
 import chalk from "chalk";
@@ -794,6 +795,149 @@ function cmdList(opts: { config: string }) {
   console.log();
 }
 
+// ── Performance command ───────────────────────────────────────────────────────
+
+async function cmdPerformance(opts: { epochs?: string; config: string }) {
+  const cfg = loadConfig(opts.config);
+  const base = (cfg.beaconNode ?? DEFAULT_BEACON).replace(/\/$/, "");
+  const indices = cfg.validators;
+
+  if (indices.length === 0) {
+    console.log(chalk.yellow("No validators configured. Use `val-monitor add <index>` first."));
+    return;
+  }
+
+  const epochCount = Math.min(Math.max(Number(opts.epochs ?? 10), 1), 50);
+  const headSlot = await fetchHeadSlot(base);
+  const headEpoch = Math.floor(headSlot / 32);
+
+  // We check epochs [headEpoch - epochCount, headEpoch - 1] — all finalised
+  const startEpoch = headEpoch - epochCount;
+  if (startEpoch < 0) {
+    console.log(chalk.yellow("Not enough epochs in chain history yet."));
+    return;
+  }
+
+  // Filter to active validators only
+  process.stdout.write(chalk.gray(`  Fetching validator state...`));
+  const allVals = await fetchValidators(indices, base);
+  const activeVals = allVals.filter(v => v.status.startsWith("active"));
+  const activeIndices = activeVals.map(v => Number(v.index));
+  process.stdout.write(chalk.gray(` ${activeIndices.length} active\n`));
+
+  if (activeIndices.length === 0) {
+    console.log(chalk.yellow("No active validators to check."));
+    return;
+  }
+
+  // attestedCount[valIdx] = number of epochs where we confirmed attestation
+  const attestedCount = new Map<number, number>(activeIndices.map(i => [i, 0]));
+  // dutiesCount[valIdx] = epochs where validator had a duty (may skip if not scheduled)
+  const dutiesCount = new Map<number, number>(activeIndices.map(i => [i, 0]));
+
+  console.log(chalk.gray(`  Checking ${epochCount} epochs (${startEpoch}–${headEpoch - 1})...`));
+  console.log();
+
+  // Process epochs in batches of 5 to avoid hammering the node
+  const BATCH = 5;
+  for (let epochBase = startEpoch; epochBase < headEpoch; epochBase += BATCH) {
+    const batch = [];
+    for (let e = epochBase; e < Math.min(epochBase + BATCH, headEpoch); e++) {
+      batch.push(e);
+    }
+
+    const results = await Promise.all(
+      batch.map(async (epoch) => {
+        const [duties, attestedMap] = await Promise.all([
+          fetchAttesterDuties(epoch, activeIndices, base),
+          checkMissedAttestations(epoch, activeIndices, base),
+        ]);
+        return { epoch, duties, attestedMap };
+      })
+    );
+
+    for (const { attestedMap, duties } of results) {
+      for (const valIdx of activeIndices) {
+        if (duties.has(valIdx)) {
+          dutiesCount.set(valIdx, (dutiesCount.get(valIdx) ?? 0) + 1);
+          // checkMissedAttestations returns true = attested, false = missed
+          if (attestedMap.get(valIdx)) {
+            attestedCount.set(valIdx, (attestedCount.get(valIdx) ?? 0) + 1);
+          }
+        }
+      }
+    }
+
+    const done = Math.min(epochBase + BATCH, headEpoch) - startEpoch;
+    process.stdout.write(`\r  Progress: ${done}/${epochCount} epochs`);
+  }
+
+  console.log("\n");
+  console.log(chalk.bold(`  Attestation Performance — Last ${epochCount} Epochs`));
+  console.log(chalk.gray(`  Beacon: ${base} | Epochs ${startEpoch}–${headEpoch - 1}`));
+  console.log();
+
+  const hIdx = "Index".padEnd(10);
+  const hDuties = "Duties".padEnd(10);
+  const hAtt = "Attested".padEnd(10);
+  const hRate = "Rate";
+  console.log("  " + chalk.bold([hIdx, hDuties, hAtt, hRate].join("  ")));
+  console.log("  " + "─".repeat(50));
+
+  let totalDuties = 0;
+  let totalAttested = 0;
+  let problemCount = 0;
+
+  // Sort by rate ascending (worst first)
+  const sorted = activeIndices.slice().sort((a, b) => {
+    const rateA = (dutiesCount.get(a) ?? 0) > 0 ? (attestedCount.get(a) ?? 0) / dutiesCount.get(a)! : 1;
+    const rateB = (dutiesCount.get(b) ?? 0) > 0 ? (attestedCount.get(b) ?? 0) / dutiesCount.get(b)! : 1;
+    return rateA - rateB;
+  });
+
+  for (const valIdx of sorted) {
+    const duties = dutiesCount.get(valIdx) ?? 0;
+    const attested = attestedCount.get(valIdx) ?? 0;
+    const rate = duties > 0 ? attested / duties : 1;
+    const pct = (rate * 100).toFixed(1) + "%";
+
+    let rateColour: (s: string) => string;
+    if (rate >= 0.99) rateColour = chalk.green;
+    else if (rate >= 0.95) rateColour = chalk.yellow;
+    else { rateColour = chalk.red; problemCount++; }
+
+    // Bar (20 chars wide)
+    const filled = Math.round(rate * 20);
+    const bar = "█".repeat(filled) + "░".repeat(20 - filled);
+
+    console.log(
+      "  " +
+      String(valIdx).padEnd(10) + "  " +
+      String(duties).padEnd(10) + "  " +
+      String(attested).padEnd(10) + "  " +
+      rateColour(`${pct.padEnd(7)} ${bar}`)
+    );
+
+    totalDuties += duties;
+    totalAttested += attested;
+  }
+
+  console.log("  " + "─".repeat(50));
+  const overallRate = totalDuties > 0 ? (totalAttested / totalDuties) * 100 : 100;
+  const overallColour = overallRate >= 99 ? chalk.green : overallRate >= 95 ? chalk.yellow : chalk.red;
+  console.log("  " + chalk.bold("Overall".padEnd(10) + "  " + String(totalDuties).padEnd(10) + "  " + String(totalAttested).padEnd(10) + "  ") + overallColour(`${overallRate.toFixed(2)}%`));
+  console.log();
+
+  if (problemCount > 0) {
+    console.log(chalk.red(`  ⚠  ${problemCount} validator(s) below 95% attestation rate`));
+  } else if (overallRate >= 99) {
+    console.log(chalk.green(`  ✓  All validators performing well (≥99% attestation rate)`));
+  } else {
+    console.log(chalk.yellow(`  ~  Performance acceptable but watch for drift`));
+  }
+  console.log();
+}
+
 function cmdSet(key: string, value: string, opts: { config: string }) {
   const cfg = loadConfig(opts.config);
   switch (key) {
@@ -820,7 +964,7 @@ const program = new Command();
 program
   .name("val-monitor")
   .description("Ethereum validator health monitor")
-  .version("1.2.0")
+  .version("1.3.0")
   .option("-c, --config <path>", "config file path", DEFAULT_CONFIG_PATH);
 
 program
@@ -891,6 +1035,15 @@ program
   .action((key, value) => {
     const parent = program.opts();
     cmdSet(key, value, { config: parent.config ?? DEFAULT_CONFIG_PATH });
+  });
+
+program
+  .command("performance")
+  .description("Show attestation performance over last N epochs (default 10, max 50)")
+  .option("--epochs <n>", "number of epochs to check (default: 10, max: 50)")
+  .action(async (opts) => {
+    const parent = program.opts();
+    await cmdPerformance({ ...opts, config: parent.config ?? DEFAULT_CONFIG_PATH });
   });
 
 program.parse();
