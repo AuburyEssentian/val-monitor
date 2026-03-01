@@ -938,6 +938,134 @@ async function cmdPerformance(opts: { epochs?: string; config: string }) {
   console.log();
 }
 
+// ── Sync committee ────────────────────────────────────────────────────────────
+
+const MAINNET_GENESIS_TIME = 1606824023;
+const SLOTS_PER_EPOCH = 32;
+const EPOCHS_PER_SYNC_PERIOD = 256;
+
+interface SyncDuty {
+  pubkey: string;
+  validator_index: string;
+  validator_sync_committee_indices: string[];
+}
+
+async function fetchSyncDuties(epoch: number, indices: number[], base: string): Promise<SyncDuty[]> {
+  const r = await fetch(`${base}/eth/v1/validator/duties/sync/${epoch}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(indices.map(String)),
+  });
+  if (!r.ok) return [];
+  const json = await r.json() as { data: SyncDuty[] };
+  return json.data ?? [];
+}
+
+function formatDuration(seconds: number): string {
+  const hrs = Math.floor(seconds / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  if (hrs > 0) return `${hrs}h ${mins}m`;
+  return `${mins}m`;
+}
+
+async function cmdSync(opts: { config: string }) {
+  const cfg = loadConfig(opts.config);
+  const base = (cfg.beaconNode ?? DEFAULT_BEACON).replace(/\/$/, "");
+  const indices = cfg.validators;
+
+  if (indices.length === 0) {
+    console.log(chalk.yellow("No validators configured. Use `val-monitor add <index>` first."));
+    return;
+  }
+
+  process.stdout.write(chalk.gray(`  Fetching sync committee duties...`));
+
+  // Fetch sequentially to avoid rate-limit issues on public nodes
+  const headSlot = await fetchHeadSlot(base);
+  const genesis = await fetchGenesis(base);
+
+  const headEpoch = Math.floor(headSlot / SLOTS_PER_EPOCH);
+  const currentPeriod = Math.floor(headEpoch / EPOCHS_PER_SYNC_PERIOD);
+  const nextPeriod = currentPeriod + 1;
+
+  const currentPeriodStart = currentPeriod * EPOCHS_PER_SYNC_PERIOD;
+  const currentPeriodEnd = currentPeriodStart + EPOCHS_PER_SYNC_PERIOD - 1;
+  const nextPeriodStart = nextPeriod * EPOCHS_PER_SYNC_PERIOD;
+  const nextPeriodEnd = nextPeriodStart + EPOCHS_PER_SYNC_PERIOD - 1;
+
+  const [currentDuties, nextDuties] = await Promise.all([
+    fetchSyncDuties(headEpoch, indices, base),
+    fetchSyncDuties(nextPeriodStart, indices, base),
+  ]);
+
+  process.stdout.write(chalk.gray(" done\n\n"));
+
+  const genesisTime = Number(genesis?.genesis_time ?? MAINNET_GENESIS_TIME);
+  const now = Math.floor(Date.now() / 1000);
+  const periodEndSlot = (currentPeriodEnd + 1) * SLOTS_PER_EPOCH;
+  const periodEndTime = genesisTime + periodEndSlot * 12;
+  const secsLeft = periodEndTime - now;
+  const epochsLeft = currentPeriodEnd - headEpoch;
+
+  console.log(chalk.bold("  Sync Committee Status"));
+  console.log(chalk.gray(`  Beacon: ${base}`));
+  console.log(chalk.gray(`  Head: epoch ${headEpoch} (slot ${headSlot})`));
+  console.log();
+
+  console.log(chalk.bold(`  Current Period (${currentPeriod}): epochs ${currentPeriodStart}–${currentPeriodEnd}`));
+  if (secsLeft > 0) {
+    console.log(chalk.gray(`  Ends in ${formatDuration(secsLeft)} (${epochsLeft} epochs, ${epochsLeft * SLOTS_PER_EPOCH} slots remaining)`));
+  } else {
+    console.log(chalk.gray(`  Period has ended`));
+  }
+  console.log();
+
+  if (currentDuties.length === 0) {
+    console.log(chalk.gray("  None of your validators are in the current sync committee."));
+  } else {
+    console.log(chalk.green(`  ✓ ${currentDuties.length} validator(s) in current sync committee:`));
+    console.log();
+    console.log("    " + chalk.bold("Index".padEnd(10) + "  Committee Positions"));
+    console.log("    " + "─".repeat(42));
+    for (const d of currentDuties) {
+      const positions = d.validator_sync_committee_indices.join(", ");
+      const count = d.validator_sync_committee_indices.length;
+      const extra = count > 1 ? chalk.yellow(` (×${count} — boosted rewards!)`) : "";
+      console.log(`    ${d.validator_index.padEnd(10)}  [${positions}]${extra}`);
+    }
+    const totalAssignments = currentDuties.reduce((s, d) => s + d.validator_sync_committee_indices.length, 0);
+    const slotsLeft = epochsLeft * SLOTS_PER_EPOCH;
+    console.log();
+    console.log(chalk.gray(`  Remaining duty: ~${slotsLeft.toLocaleString()} slots × ${totalAssignments} position(s)`));
+  }
+
+  console.log();
+  console.log(chalk.bold(`  Next Period (${nextPeriod}): epochs ${nextPeriodStart}–${nextPeriodEnd}`));
+  const nextPeriodStartTime = genesisTime + nextPeriodStart * SLOTS_PER_EPOCH * 12;
+  const startsIn = nextPeriodStartTime - now;
+  console.log(chalk.gray(`  Starts in ${formatDuration(startsIn)}`));
+  console.log();
+
+  if (headEpoch < currentPeriodEnd - 1) {
+    console.log(chalk.gray("  Next period committee not yet finalized (available ~1 epoch before period start)."));
+  } else if (nextDuties.length === 0) {
+    console.log(chalk.gray("  None of your validators selected for next period."));
+  } else {
+    console.log(chalk.green(`  ✓ ${nextDuties.length} validator(s) selected for next period:`));
+    for (const d of nextDuties) {
+      const positions = d.validator_sync_committee_indices.join(", ");
+      console.log(`    Validator ${d.validator_index} — positions [${positions}]`);
+    }
+  }
+
+  console.log();
+  if (currentDuties.length > 0) {
+    console.log(chalk.yellow(`  ⚡ Sync committee active — ensure your beacon client is performing optimally.`));
+    console.log(chalk.yellow(`     Missing sync duties reduces rewards for the entire remaining period.`));
+    console.log();
+  }
+}
+
 function cmdSet(key: string, value: string, opts: { config: string }) {
   const cfg = loadConfig(opts.config);
   switch (key) {
@@ -964,7 +1092,7 @@ const program = new Command();
 program
   .name("val-monitor")
   .description("Ethereum validator health monitor")
-  .version("1.3.0")
+  .version("1.4.0")
   .option("-c, --config <path>", "config file path", DEFAULT_CONFIG_PATH);
 
 program
@@ -1044,6 +1172,14 @@ program
   .action(async (opts) => {
     const parent = program.opts();
     await cmdPerformance({ ...opts, config: parent.config ?? DEFAULT_CONFIG_PATH });
+  });
+
+program
+  .command("sync")
+  .description("Check sync committee membership for current and next period")
+  .action(async () => {
+    const parent = program.opts();
+    await cmdSync({ config: parent.config ?? DEFAULT_CONFIG_PATH });
   });
 
 program.parse();
