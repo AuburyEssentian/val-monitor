@@ -1,71 +1,77 @@
 # val-monitor
 
-Quick Ethereum validator health check. Uses the standard CL REST API — no API keys required.
+Ethereum validator health monitor. Uses the standard CL REST API — no API key required.
 
 ## Install
 
-```sh
+```bash
 cd val-monitor
 bun install
-bun link  # makes `val-monitor` available globally
-```
-
-Or run directly:
-
-```sh
-bun run index.ts status --index 12345
+# optional: link globally
+bun link
 ```
 
 ## Usage
 
-```sh
-# Add validators to track
+```bash
+# Track validators
 val-monitor add 12345
-val-monitor add 67890
+val-monitor add 67890 --webhook https://discord.com/api/webhooks/...
 
-# Check status
+# Configure beacon node and webhook without editing JSON
+val-monitor set beacon http://samcm-nuc14-1:5052
+val-monitor set webhook https://discord.com/api/webhooks/...
+
+# Check status (includes upcoming block proposals)
 val-monitor status
+val-monitor status --index 12345 67890  # ad-hoc, not saved
 
-# Ad-hoc check (not saved to config)
-val-monitor status --index 1 2 3
+# Show attester + proposer duties for current epoch
+val-monitor duties
+val-monitor duties --epoch 337000
 
-# List tracked validators
+# Check for missed attestations (last epoch)
+val-monitor missed
+val-monitor missed --epoch 337000
+
+# Watch continuously (polls every 60s, alerts to Discord on issues)
+val-monitor watch
+val-monitor watch --interval 30 --webhook https://discord.com/api/webhooks/...
+
+# List config
 val-monitor list
-
-# Remove a validator
-val-monitor remove 12345
 ```
 
 ## Config
 
-Config lives at `~/.val-monitor.json`. To use your own beacon node instead of the public Lodestar endpoint:
+Stored at `~/.val-monitor.json`:
 
 ```json
 {
   "validators": [12345, 67890],
-  "beaconNode": "http://localhost:5052"
+  "beaconNode": "http://localhost:5052",
+  "webhook": "https://discord.com/api/webhooks/..."
 }
 ```
 
-Any beacon node that exposes the standard Ethereum CL REST API works (Lighthouse, Prysm, Teku, Lodestar, Grandine).
+Set `beaconNode` to point at your own node. Defaults to `lodestar-mainnet.chainsafe.io`.
 
-## Output
+## What it monitors
 
+- **status** — validator state, balance, effective balance, next attestation slot, upcoming block proposals
+- **duties** — full epoch view: all attester duties (grouped by slot) + proposer duties with hit/miss for past slots
+- **missed** — checks if validators actually attested in a given epoch (reads aggregation_bits from blocks)
+- **watch** — continuous loop:
+  - Balance drops > 0.01 ETH
+  - Status changes (e.g. active → exiting)
+  - Slashing events
+  - Missed attestations (checked once per epoch transition)
+  - Missed block proposals (checked when a scheduled proposal slot passes)
+  - Sends Discord webhook alert on any of the above
+
+## Pointing at Sam's nodes
+
+```bash
+val-monitor set beacon http://samcm-nuc14-1:5052
+val-monitor add 12345
 ```
-  Validator Status
-  Beacon: http://localhost:5052 | Finalized epoch: 430967 | Head epoch ~430969
-
-  Index       Status                  Balance ETH     Eff Bal ETH     Next Att Slot
-  ────────────────────────────────────────────────────────────────────────────────
-  12345       active_ongoing          32.0481         32.0000         13791024
-
-  ✓  All 1 validators active and healthy
-  Active: 1/1  |  Total balance: 32.0481 ETH
-  Chain uptime: 1915 days
-```
-
-Fields:
-- **Status**: CL validator lifecycle state
-- **Balance**: current balance in ETH
-- **Eff Bal**: effective balance (what's used for attestation weight)
-- **Next Att Slot**: next slot this validator is scheduled to attest
