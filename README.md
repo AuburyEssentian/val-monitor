@@ -38,6 +38,10 @@ val-monitor missed --epoch 337000
 val-monitor watch
 val-monitor watch --interval 30 --webhook https://discord.com/api/webhooks/...
 
+# Attestation performance over last N epochs (default 10, max 50)
+val-monitor performance
+val-monitor performance --epochs 20
+
 # List config
 val-monitor list
 ```
@@ -61,6 +65,7 @@ Set `beaconNode` to point at your own node. Defaults to `lodestar-mainnet.chains
 - **status** — validator state, balance, effective balance, next attestation slot, upcoming block proposals
 - **duties** — full epoch view: all attester duties (grouped by slot) + proposer duties with hit/miss for past slots
 - **missed** — checks if validators actually attested in a given epoch (reads aggregation_bits from blocks)
+- **performance** — attestation rate over the last N epochs (1–50), per-validator with ASCII bar chart, sorted by worst performers first
 - **watch** — continuous loop:
   - Balance drops > 0.01 ETH
   - Status changes (e.g. active → exiting)
