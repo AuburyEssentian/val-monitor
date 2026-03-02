@@ -44,6 +44,13 @@ val-monitor performance --epochs 20
 
 # List config
 val-monitor list
+
+# Sync committee membership (current + next period)
+val-monitor sync
+
+# Prometheus metrics endpoint (for Grafana/VictoriaMetrics)
+val-monitor metrics
+val-monitor metrics --port 9100
 ```
 
 ## Config
@@ -73,6 +80,40 @@ Set `beaconNode` to point at your own node. Defaults to `lodestar-mainnet.chains
   - Missed attestations (checked once per epoch transition)
   - Missed block proposals (checked when a scheduled proposal slot passes)
   - Sends Discord webhook alert on any of the above
+
+## Prometheus metrics (v1.5+)
+
+```bash
+# Start a Prometheus /metrics endpoint (default: port 9090)
+val-monitor metrics
+val-monitor metrics --port 9100
+
+# Example scrape config for VictoriaMetrics / Prometheus
+```
+
+Add to your `prometheus.yml` or `victoria-metrics.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: val-monitor
+    static_configs:
+      - targets: ['localhost:9090']
+    scrape_interval: 60s
+```
+
+**Exposed metrics:**
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `val_monitor_balance_gwei` | gauge | Validator balance in Gwei |
+| `val_monitor_balance_eth` | gauge | Validator balance in ETH |
+| `val_monitor_active` | gauge | 1 if status is active, 0 otherwise |
+| `val_monitor_slashed` | gauge | 1 if slashed |
+| `val_monitor_attestation_rate` | gauge | Attestation effectiveness (0–1) over last 10 epochs |
+| `val_monitor_sync_duty` | gauge | 1 if in current sync committee |
+| `val_monitor_last_scrape_timestamp` | gauge | Unix timestamp of last successful scrape |
+
+All metrics have `index` and `pubkey` labels. Scraping is on-demand — no background polling.
 
 ## Pointing at Sam's nodes
 

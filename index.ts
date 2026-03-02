@@ -18,6 +18,7 @@
  *   val-monitor watch --webhook <url>   # post alerts to Discord webhook
  *   val-monitor missed [--epoch N]      # check for missed attestations last epoch
  *   val-monitor performance [--epochs N] # attestation rate over last N epochs (default 10)
+ *   val-monitor metrics [--port 9090]   # Prometheus /metrics endpoint for Grafana/VictoriaMetrics
  */
 
 import chalk from "chalk";
@@ -1085,6 +1086,181 @@ function cmdSet(key: string, value: string, opts: { config: string }) {
   }
 }
 
+// ── Prometheus metrics ────────────────────────────────────────────────────────
+
+/**
+ * Build a Prometheus text-format metrics payload for the given validators.
+ *
+ * Exposed metrics:
+ *   val_monitor_balance_gwei{index,pubkey}     — effective balance in Gwei
+ *   val_monitor_balance_eth{index,pubkey}      — balance in ETH (float)
+ *   val_monitor_active{index,pubkey}           — 1 if active, 0 otherwise
+ *   val_monitor_slashed{index,pubkey}          — 1 if slashed
+ *   val_monitor_attestation_rate{index,pubkey} — attestation rate 0–1 (last 10 epochs)
+ *   val_monitor_sync_duty{index,pubkey}        — 1 if in current sync committee
+ *   val_monitor_scrape_errors_total            — number of fetch failures since start
+ *   val_monitor_last_scrape_timestamp          — unix timestamp of last successful scrape
+ */
+async function buildMetrics(cfg: Config): Promise<string> {
+  const base = (cfg.beaconNode ?? DEFAULT_BEACON).replace(/\/$/, "");
+  const indices = cfg.validators;
+
+  if (indices.length === 0) {
+    return "# val-monitor: no validators configured\n";
+  }
+
+  const lines: string[] = [];
+  const ts = Math.floor(Date.now() / 1000);
+
+  // Fetch validators
+  const validators = await fetchValidators(indices, base);
+  const validatorMap = new Map<number, CLValidator>(
+    validators.map(v => [Number(v.index), v])
+  );
+
+  // Balance / status metrics
+  lines.push("# HELP val_monitor_balance_gwei Validator balance in Gwei");
+  lines.push("# TYPE val_monitor_balance_gwei gauge");
+  lines.push("# HELP val_monitor_balance_eth Validator balance in ETH");
+  lines.push("# TYPE val_monitor_balance_eth gauge");
+  lines.push("# HELP val_monitor_active 1 if validator is active, 0 otherwise");
+  lines.push("# TYPE val_monitor_active gauge");
+  lines.push("# HELP val_monitor_slashed 1 if validator is slashed");
+  lines.push("# TYPE val_monitor_slashed gauge");
+
+  for (const idx of indices) {
+    const v = validatorMap.get(idx);
+    if (!v) continue;
+    const label = `index="${idx}",pubkey="${v.validator.pubkey.slice(0, 14)}…"`;
+    const balGwei = Number(v.balance);
+    const balEth  = balGwei / 1e9;
+    const active  = v.status.startsWith("active") ? 1 : 0;
+    const slashed = v.validator.slashed ? 1 : 0;
+
+    lines.push(`val_monitor_balance_gwei{${label}} ${balGwei}`);
+    lines.push(`val_monitor_balance_eth{${label}} ${balEth.toFixed(6)}`);
+    lines.push(`val_monitor_active{${label}} ${active}`);
+    lines.push(`val_monitor_slashed{${label}} ${slashed}`);
+  }
+
+  // Attestation rate — last 10 epochs
+  lines.push("# HELP val_monitor_attestation_rate Attestation effectiveness over last 10 epochs (0-1)");
+  lines.push("# TYPE val_monitor_attestation_rate gauge");
+
+  try {
+    const headSlot = await fetchHeadSlot(base);
+    const headEpoch = Math.floor(headSlot / 32);
+    const checkEpochs = Math.min(10, headEpoch - 1);
+    const startEpoch = Math.max(0, headEpoch - checkEpochs - 1);
+
+    const dutiesPerValidator = new Map<number, number>(indices.map(i => [i, 0]));
+    const attestedPerValidator = new Map<number, number>(indices.map(i => [i, 0]));
+
+    for (let ep = startEpoch; ep < headEpoch - 1; ep++) {
+      const duties = await fetchAttesterDuties(ep, indices, base);
+      const missed = await checkMissedAttestations(ep, indices, base);
+      for (const [valIdx, duty] of duties) {
+        if (duty) {
+          dutiesPerValidator.set(valIdx, (dutiesPerValidator.get(valIdx) ?? 0) + 1);
+          if (missed.get(valIdx)) {
+            attestedPerValidator.set(valIdx, (attestedPerValidator.get(valIdx) ?? 0) + 1);
+          }
+        }
+      }
+    }
+
+    for (const idx of indices) {
+      const v = validatorMap.get(idx);
+      if (!v) continue;
+      const label = `index="${idx}",pubkey="${v.validator.pubkey.slice(0, 14)}…"`;
+      const duties = dutiesPerValidator.get(idx) ?? 0;
+      const attested = attestedPerValidator.get(idx) ?? 0;
+      const rate = duties > 0 ? attested / duties : 1;
+      lines.push(`val_monitor_attestation_rate{${label}} ${rate.toFixed(4)}`);
+    }
+  } catch {
+    // Non-fatal — skip attestation metrics if fetch fails
+  }
+
+  // Sync committee duty
+  lines.push("# HELP val_monitor_sync_duty 1 if validator is in current sync committee");
+  lines.push("# TYPE val_monitor_sync_duty gauge");
+
+  try {
+    const headSlot = await fetchHeadSlot(base);
+    const headEpoch = Math.floor(headSlot / 32);
+    const syncDuties = await fetchSyncDuties(headEpoch, indices, base);
+    const inSync = new Set(syncDuties.map(d => Number(d.validator_index)));
+
+    for (const idx of indices) {
+      const v = validatorMap.get(idx);
+      if (!v) continue;
+      const label = `index="${idx}",pubkey="${v.validator.pubkey.slice(0, 14)}…"`;
+      lines.push(`val_monitor_sync_duty{${label}} ${inSync.has(idx) ? 1 : 0}`);
+    }
+  } catch {
+    // Non-fatal
+  }
+
+  // Scrape metadata
+  lines.push("# HELP val_monitor_last_scrape_timestamp Unix timestamp of last successful metrics scrape");
+  lines.push("# TYPE val_monitor_last_scrape_timestamp gauge");
+  lines.push(`val_monitor_last_scrape_timestamp ${ts}`);
+  lines.push("");
+
+  return lines.join("\n");
+}
+
+async function cmdMetrics(opts: { port: string; config: string }) {
+  const cfg = loadConfig(opts.config);
+  const port = parseInt(opts.port, 10) || 9090;
+
+  console.log(chalk.cyan(`val-monitor metrics`));
+  console.log(chalk.gray(`  Prometheus endpoint: http://0.0.0.0:${port}/metrics`));
+  console.log(chalk.gray(`  Validators: ${cfg.validators.join(", ") || "none"}`));
+  console.log(chalk.gray(`  Beacon: ${cfg.beaconNode ?? DEFAULT_BEACON}`));
+  console.log(chalk.gray(`  Scrape on demand — no background polling`));
+  console.log();
+
+  let scrapeErrors = 0;
+
+  Bun.serve({
+    port,
+    async fetch(req) {
+      const url = new URL(req.url);
+
+      if (url.pathname === "/metrics") {
+        try {
+          const body = await buildMetrics(cfg);
+          return new Response(body, {
+            headers: { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" },
+          });
+        } catch (err) {
+          scrapeErrors++;
+          console.error(chalk.red(`Scrape error: ${err}`));
+          return new Response(`# scrape error: ${err}\nval_monitor_scrape_errors_total ${scrapeErrors}\n`, {
+            status: 500,
+            headers: { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" },
+          });
+        }
+      }
+
+      if (url.pathname === "/health" || url.pathname === "/") {
+        return new Response(JSON.stringify({ status: "ok", validators: cfg.validators.length }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      return new Response("Not found", { status: 404 });
+    },
+  });
+
+  console.log(chalk.green(`  Listening on :${port} — Ctrl+C to stop`));
+
+  // Keep alive
+  await new Promise(() => {});
+}
+
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 const program = new Command();
@@ -1092,7 +1268,7 @@ const program = new Command();
 program
   .name("val-monitor")
   .description("Ethereum validator health monitor")
-  .version("1.4.0")
+  .version("1.5.0")
   .option("-c, --config <path>", "config file path", DEFAULT_CONFIG_PATH);
 
 program
@@ -1180,6 +1356,15 @@ program
   .action(async () => {
     const parent = program.opts();
     await cmdSync({ config: parent.config ?? DEFAULT_CONFIG_PATH });
+  });
+
+program
+  .command("metrics")
+  .description("Start a Prometheus /metrics endpoint for Grafana/VictoriaMetrics scraping")
+  .option("--port <port>", "port to listen on (default: 9090)", "9090")
+  .action(async (opts) => {
+    const parent = program.opts();
+    await cmdMetrics({ ...opts, config: parent.config ?? DEFAULT_CONFIG_PATH });
   });
 
 program.parse();
