@@ -51,6 +51,12 @@ val-monitor sync
 # Prometheus metrics endpoint (for Grafana/VictoriaMetrics)
 val-monitor metrics
 val-monitor metrics --port 9100
+
+# Exit queue: depth, churn limit, ETA — highlights your tracked validators
+val-monitor exit-queue
+
+# Beacon node health: peer count, sync status, client version
+val-monitor peers
 ```
 
 ## Config
@@ -73,6 +79,8 @@ Set `beaconNode` to point at your own node. Defaults to `lodestar-mainnet.chains
 - **duties** — full epoch view: all attester duties (grouped by slot) + proposer duties with hit/miss for past slots
 - **missed** — checks if validators actually attested in a given epoch (reads aggregation_bits from blocks)
 - **performance** — attestation rate over the last N epochs (1–50), per-validator with ASCII bar chart, sorted by worst performers first
+- **exit-queue** — global exit queue: depth, churn limit (derived from active validator count + chain spec), per-epoch schedule, ETA for last validator to exit — tracked validators highlighted if present
+- **peers** — beacon node health: client version, peer ID, sync status (synced/syncing + distance), peer counts with health assessment
 - **watch** — continuous loop:
   - Balance drops > 0.01 ETH
   - Status changes (e.g. active → exiting)
@@ -81,7 +89,7 @@ Set `beaconNode` to point at your own node. Defaults to `lodestar-mainnet.chains
   - Missed block proposals (checked when a scheduled proposal slot passes)
   - Sends Discord webhook alert on any of the above
 
-## Prometheus metrics (v1.5+)
+## Prometheus metrics (v1.5+, metrics endpoint v1.6+)
 
 ```bash
 # Start a Prometheus /metrics endpoint (default: port 9090)

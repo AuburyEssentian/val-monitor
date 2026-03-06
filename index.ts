@@ -19,6 +19,8 @@
  *   val-monitor missed [--epoch N]      # check for missed attestations last epoch
  *   val-monitor performance [--epochs N] # attestation rate over last N epochs (default 10)
  *   val-monitor metrics [--port 9090]   # Prometheus /metrics endpoint for Grafana/VictoriaMetrics
+ *   val-monitor exit-queue              # show exit queue depth, churn limit, ETA
+ *   val-monitor peers                   # beacon node peer count and sync status
  */
 
 import chalk from "chalk";
@@ -1067,6 +1069,326 @@ async function cmdSync(opts: { config: string }) {
   }
 }
 
+// ── Exit queue ────────────────────────────────────────────────────────────────
+
+interface ChainSpec {
+  MIN_PER_EPOCH_CHURN_LIMIT: string;
+  CHURN_LIMIT_QUOTIENT: string;
+  SLOTS_PER_EPOCH: string;
+  SECONDS_PER_SLOT: string;
+}
+
+async function fetchChainSpec(base: string): Promise<ChainSpec | null> {
+  const r = await fetch(`${base}/eth/v1/config/spec`).catch(() => null);
+  if (!r || !r.ok) return null;
+  const j = await r.json() as { data: ChainSpec };
+  return j.data ?? null;
+}
+
+async function fetchActiveValidatorCount(base: string): Promise<number> {
+  // Use validator count from finality_checkpoints state — cheaper than full list
+  const r = await fetch(`${base}/eth/v1/beacon/states/head/validators?status=active_ongoing&status=active_exiting&status=active_slashed`).catch(() => null);
+  if (!r || !r.ok) return 0;
+  const j = await r.json() as { data: unknown[] };
+  return j.data?.length ?? 0;
+}
+
+interface ExitQueueValidator {
+  index: number;
+  exit_epoch: number;
+  withdrawable_epoch: number;
+  status: string;
+  balance: string;
+  pubkey: string;
+  slashed: boolean;
+}
+
+async function fetchExitingValidators(base: string): Promise<ExitQueueValidator[]> {
+  const statuses = ["active_exiting", "exiting_slashed"];
+  const results: ExitQueueValidator[] = [];
+  for (const status of statuses) {
+    const r = await fetch(`${base}/eth/v1/beacon/states/head/validators?status=${status}`).catch(() => null);
+    if (!r || !r.ok) continue;
+    const j = await r.json() as { data: Array<{ index: string; balance: string; status: string; validator: { pubkey: string; exit_epoch: string; withdrawable_epoch: string; slashed: boolean } }> };
+    for (const v of j.data ?? []) {
+      results.push({
+        index: Number(v.index),
+        exit_epoch: Number(v.validator.exit_epoch),
+        withdrawable_epoch: Number(v.validator.withdrawable_epoch),
+        status: v.status,
+        balance: v.balance,
+        pubkey: v.validator.pubkey,
+        slashed: v.validator.slashed,
+      });
+    }
+  }
+  return results;
+}
+
+async function cmdExitQueue(opts: { config: string }) {
+  const cfg = loadConfig(opts.config);
+  const base = (cfg.beaconNode ?? DEFAULT_BEACON).replace(/\/$/, "");
+  const trackedIndices = new Set(cfg.validators);
+
+  process.stdout.write(chalk.gray(`  Fetching exit queue data from ${base}...`));
+
+  const [spec, headSlot, exitingVals, genesis] = await Promise.all([
+    fetchChainSpec(base),
+    fetchHeadSlot(base),
+    fetchExitingValidators(base),
+    fetchGenesis(base),
+  ]);
+
+  // Active validator count (needed for churn limit)
+  const activeCount = await fetchActiveValidatorCount(base);
+
+  process.stdout.write(chalk.gray(" done\n\n"));
+
+  const headEpoch = Math.floor(headSlot / 32);
+  const genesisTime = Number(genesis?.genesis_time ?? 1606824023);
+
+  // Calculate churn limit
+  const minChurn = Number(spec?.MIN_PER_EPOCH_CHURN_LIMIT ?? 4);
+  const churnQuotient = Number(spec?.CHURN_LIMIT_QUOTIENT ?? 65536);
+  const churnLimit = Math.max(minChurn, Math.floor(activeCount / churnQuotient));
+  const secsPerEpoch = 32 * 12; // 32 slots × 12s
+
+  console.log(chalk.bold("  Exit Queue"));
+  console.log(chalk.gray(`  Beacon: ${base}`));
+  console.log(chalk.gray(`  Head epoch: ${headEpoch} | Active validators: ${activeCount.toLocaleString()}`));
+  console.log(chalk.gray(`  Churn limit: ${churnLimit} validator(s)/epoch`));
+  console.log();
+
+  if (exitingVals.length === 0) {
+    console.log(chalk.green("  ✓  Exit queue is empty — no validators currently exiting."));
+    console.log();
+    return;
+  }
+
+  // Sort by exit_epoch
+  exitingVals.sort((a, b) => a.exit_epoch - b.exit_epoch);
+  const lastExitEpoch = exitingVals[exitingVals.length - 1]!.exit_epoch;
+  const queueDepth = exitingVals.length;
+  const epochsRemaining = Math.max(0, lastExitEpoch - headEpoch);
+  const etaSeconds = epochsRemaining * secsPerEpoch;
+
+  const etaStr = etaSeconds === 0
+    ? "completed"
+    : etaSeconds < 3600
+      ? `~${Math.ceil(etaSeconds / 60)}m`
+      : etaSeconds < 86400
+        ? `~${(etaSeconds / 3600).toFixed(1)}h`
+        : `~${(etaSeconds / 86400).toFixed(1)} days`;
+
+  // Count validators per exit epoch (queue depth visualization)
+  const byExitEpoch = new Map<number, number>();
+  for (const v of exitingVals) {
+    byExitEpoch.set(v.exit_epoch, (byExitEpoch.get(v.exit_epoch) ?? 0) + 1);
+  }
+
+  console.log(chalk.bold(`  Queue depth: ${queueDepth} validators`));
+  console.log(chalk.gray(`  Last exit epoch: ${lastExitEpoch} (${epochsRemaining} epochs away — ${etaStr})`));
+  console.log();
+
+  // Show per-epoch breakdown (up to 10 epochs)
+  const epochsSorted = [...byExitEpoch.keys()].sort((a, b) => a - b);
+  const showEpochs = epochsSorted.slice(0, 10);
+  if (showEpochs.length > 0) {
+    console.log(chalk.bold("  Exit schedule (first 10 epochs):"));
+    for (const ep of showEpochs) {
+      const count = byExitEpoch.get(ep) ?? 0;
+      const epochDiff = ep - headEpoch;
+      const timeLabel = epochDiff <= 0 ? chalk.gray("(past)") : chalk.gray(`(in ${Math.ceil(epochDiff * secsPerEpoch / 60)}m)`);
+      const bar = "█".repeat(Math.min(count, 20));
+      console.log(`    epoch ${String(ep).padEnd(8)} ${timeLabel.padEnd(15)} ${chalk.cyan(bar)} ${count}`);
+    }
+    if (epochsSorted.length > 10) {
+      console.log(chalk.gray(`    ... and ${epochsSorted.length - 10} more epochs`));
+    }
+    console.log();
+  }
+
+  // Highlight tracked validators in the queue
+  const trackedInQueue = exitingVals.filter(v => trackedIndices.has(v.index));
+  if (trackedInQueue.length > 0) {
+    console.log(chalk.yellow(`  ⚠  Your validators in exit queue:`));
+    console.log();
+    const hIdx = "Index".padEnd(10);
+    const hStatus = "Status".padEnd(22);
+    const hExitEp = "Exit Epoch".padEnd(14);
+    const hETA = "ETA";
+    console.log("  " + chalk.bold([hIdx, hStatus, hExitEp, hETA].join("  ")));
+    console.log("  " + "─".repeat(65));
+    for (const v of trackedInQueue) {
+      const epochsLeft = Math.max(0, v.exit_epoch - headEpoch);
+      const secsLeft = epochsLeft * secsPerEpoch;
+      const eta = secsLeft === 0 ? chalk.green("done") : secsLeft < 3600
+        ? chalk.yellow(`~${Math.ceil(secsLeft / 60)}m`)
+        : secsLeft < 86400
+          ? chalk.yellow(`~${(secsLeft / 3600).toFixed(1)}h`)
+          : chalk.yellow(`~${(secsLeft / 86400).toFixed(1)}d`);
+      const statusStr = v.slashed ? chalk.red(v.status + " SLASHED") : chalk.yellow(v.status);
+      const statusPad = " ".repeat(Math.max(0, 22 - (v.status.length + (v.slashed ? 8 : 0))));
+      console.log(
+        "  " +
+        String(v.index).padEnd(10) + "  " +
+        statusStr + statusPad + "  " +
+        String(v.exit_epoch).padEnd(14) + "  " +
+        eta
+      );
+    }
+    console.log();
+  } else if (trackedIndices.size > 0) {
+    console.log(chalk.green("  ✓  None of your validators are in the exit queue."));
+    console.log();
+  }
+}
+
+// ── Peers / sync status ───────────────────────────────────────────────────────
+
+interface NodeSyncStatus {
+  head_slot: string;
+  sync_distance: string;
+  is_syncing: boolean;
+  is_optimistic: boolean;
+  el_offline: boolean;
+}
+
+interface NodePeerCount {
+  disconnected: string;
+  connected: string;
+  connecting: string;
+  disconnecting: string;
+}
+
+interface NodeIdentity {
+  peer_id: string;
+  enr: string;
+  p2p_addresses: string[];
+  discovery_addresses: string[];
+  metadata: {
+    seq_number: string;
+    attnets: string;
+    syncnets: string;
+  };
+}
+
+async function fetchSyncStatus(base: string): Promise<NodeSyncStatus | null> {
+  const r = await fetch(`${base}/eth/v1/node/syncing`).catch(() => null);
+  if (!r || !r.ok) return null;
+  const j = await r.json() as { data: NodeSyncStatus };
+  return j.data ?? null;
+}
+
+async function fetchPeerCount(base: string): Promise<NodePeerCount | null> {
+  const r = await fetch(`${base}/eth/v1/node/peer_count`).catch(() => null);
+  if (!r || !r.ok) return null;
+  const j = await r.json() as { data: NodePeerCount };
+  return j.data ?? null;
+}
+
+async function fetchNodeIdentity(base: string): Promise<NodeIdentity | null> {
+  const r = await fetch(`${base}/eth/v1/node/identity`).catch(() => null);
+  if (!r || !r.ok) return null;
+  const j = await r.json() as { data: NodeIdentity };
+  return j.data ?? null;
+}
+
+async function fetchNodeVersion(base: string): Promise<string | null> {
+  const r = await fetch(`${base}/eth/v1/node/version`).catch(() => null);
+  if (!r || !r.ok) return null;
+  const j = await r.json() as { data: { version: string } };
+  return j.data?.version ?? null;
+}
+
+async function cmdPeers(opts: { config: string }) {
+  const cfg = loadConfig(opts.config);
+  const base = (cfg.beaconNode ?? DEFAULT_BEACON).replace(/\/$/, "");
+
+  process.stdout.write(chalk.gray(`  Querying ${base}...`));
+
+  const [syncStatus, peerCount, identity, version] = await Promise.all([
+    fetchSyncStatus(base),
+    fetchPeerCount(base),
+    fetchNodeIdentity(base),
+    fetchNodeVersion(base),
+  ]);
+
+  process.stdout.write(chalk.gray(" done\n\n"));
+
+  console.log(chalk.bold("  Beacon Node Health"));
+  console.log(chalk.gray(`  Beacon: ${base}`));
+  console.log();
+
+  // Version
+  if (version) {
+    console.log(`  ${chalk.bold("Client:")}  ${version}`);
+  }
+
+  // Identity
+  if (identity) {
+    const peerIdShort = identity.peer_id.slice(0, 16) + "…";
+    console.log(`  ${chalk.bold("Peer ID:")} ${peerIdShort}`);
+    if (identity.p2p_addresses.length > 0) {
+      console.log(`  ${chalk.bold("Listen:")}  ${identity.p2p_addresses[0]}`);
+    }
+  }
+
+  console.log();
+
+  // Sync status
+  if (syncStatus) {
+    const syncDistance = Number(syncStatus.sync_distance);
+    const headSlot = Number(syncStatus.head_slot);
+    const syncing = syncStatus.is_syncing || syncDistance > 2;
+
+    const syncLabel = syncing
+      ? chalk.red(`SYNCING  (${syncDistance} slots behind)`)
+      : chalk.green("SYNCED");
+
+    const optimisticLabel = syncStatus.is_optimistic
+      ? chalk.yellow(" [optimistic]")
+      : "";
+
+    const elLabel = syncStatus.el_offline
+      ? chalk.red("  ⚠  EL offline!")
+      : "";
+
+    console.log(`  ${chalk.bold("Sync:")}    ${syncLabel}${optimisticLabel}${elLabel}`);
+    console.log(`  ${chalk.bold("Head:")}    slot ${headSlot} (epoch ${Math.floor(headSlot / 32)})`);
+  } else {
+    console.log(`  ${chalk.bold("Sync:")}    ${chalk.red("unavailable")}`);
+  }
+
+  console.log();
+
+  // Peer counts
+  if (peerCount) {
+    const connected = Number(peerCount.connected);
+    const connecting = Number(peerCount.connecting);
+    const disconnecting = Number(peerCount.disconnecting);
+
+    const connectedLabel = connected < 10
+      ? chalk.red(String(connected))
+      : connected < 25
+        ? chalk.yellow(String(connected))
+        : chalk.green(String(connected));
+
+    const healthLabel = connected < 10
+      ? chalk.red("  ⚠  Low peer count — may affect performance")
+      : connected < 25
+        ? chalk.yellow("  ~  Moderate peer count")
+        : chalk.green("  ✓  Healthy peer count");
+
+    console.log(`  ${chalk.bold("Peers:")}   ${connectedLabel} connected  |  ${connecting} connecting  |  ${disconnecting} disconnecting`);
+    console.log(healthLabel);
+  } else {
+    console.log(`  ${chalk.bold("Peers:")}   ${chalk.red("unavailable (node may restrict /eth/v1/node/peer_count on public endpoints)")}`);
+  }
+
+  console.log();
+}
+
 function cmdSet(key: string, value: string, opts: { config: string }) {
   const cfg = loadConfig(opts.config);
   switch (key) {
@@ -1268,7 +1590,7 @@ const program = new Command();
 program
   .name("val-monitor")
   .description("Ethereum validator health monitor")
-  .version("1.5.0")
+  .version("1.6.0")
   .option("-c, --config <path>", "config file path", DEFAULT_CONFIG_PATH);
 
 program
@@ -1365,6 +1687,22 @@ program
   .action(async (opts) => {
     const parent = program.opts();
     await cmdMetrics({ ...opts, config: parent.config ?? DEFAULT_CONFIG_PATH });
+  });
+
+program
+  .command("exit-queue")
+  .description("Show global exit queue depth, churn limit, and ETA — highlights your tracked validators")
+  .action(async () => {
+    const parent = program.opts();
+    await cmdExitQueue({ config: parent.config ?? DEFAULT_CONFIG_PATH });
+  });
+
+program
+  .command("peers")
+  .description("Show beacon node peer count and sync status")
+  .action(async () => {
+    const parent = program.opts();
+    await cmdPeers({ config: parent.config ?? DEFAULT_CONFIG_PATH });
   });
 
 program.parse();
