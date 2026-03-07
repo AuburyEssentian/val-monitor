@@ -21,6 +21,7 @@
  *   val-monitor metrics [--port 9090]   # Prometheus /metrics endpoint for Grafana/VictoriaMetrics
  *   val-monitor exit-queue              # show exit queue depth, churn limit, ETA
  *   val-monitor peers                   # beacon node peer count and sync status
+ *   val-monitor report                  # full health report — status + missed + proposals (posts to webhook)
  */
 
 import chalk from "chalk";
@@ -1408,6 +1409,250 @@ function cmdSet(key: string, value: string, opts: { config: string }) {
   }
 }
 
+// ── Report command ────────────────────────────────────────────────────────────
+
+/**
+ * `val-monitor report` — single-shot health summary.
+ *
+ * Combines:
+ *   - Validator status (balance, active/inactive, slashed)
+ *   - Missed attestations last epoch
+ *   - Upcoming block proposals (current + next epoch)
+ *   - Network finalization health
+ *
+ * Prints to stdout and optionally posts a Discord embed to the configured webhook.
+ */
+async function cmdReport(opts: { webhook?: string; index?: string[]; config: string }) {
+  const cfg = loadConfig(opts.config);
+  const base = (cfg.beaconNode ?? DEFAULT_BEACON).replace(/\/$/, "");
+  const webhook = opts.webhook ?? cfg.webhook;
+
+  // Support ad-hoc --index like the status command
+  if (opts.index) {
+    const adhoc = opts.index.map(Number).filter(n => !isNaN(n));
+    cfg.validators = adhoc;
+  }
+
+  if (cfg.validators.length === 0) {
+    console.log(chalk.yellow("No validators configured. Use `val-monitor add <index>` first."));
+    return;
+  }
+
+  const ts = new Date();
+  const tsLabel = ts.toISOString().replace("T", " ").slice(0, 19) + " UTC";
+
+  process.stdout.write(chalk.gray(`  Generating report for ${cfg.validators.length} validators...`));
+
+  // Parallel fetches
+  const [validators, checkpoints, genesis] = await Promise.all([
+    fetchValidators(cfg.validators, base),
+    fetchFinalityCheckpoints(base),
+    fetchGenesis(base),
+  ]);
+
+  const headSlot = await fetchHeadSlot(base);
+  const headEpoch = Math.floor(headSlot / 32);
+  const finalizedEpoch = Number(checkpoints?.finalized.epoch ?? 0);
+  const lastEpoch = Math.max(0, headEpoch - 1);
+
+  const activeIndices = validators
+    .filter(v => v.status.startsWith("active"))
+    .map(v => Number(v.index));
+
+  // Parallel duty fetches
+  const [missedMap, proposerDuties] = await Promise.all([
+    activeIndices.length > 0
+      ? checkMissedAttestations(lastEpoch, activeIndices, base)
+      : Promise.resolve(new Map<number, boolean>()),
+    activeIndices.length > 0
+      ? Promise.all([
+          fetchProposerDuties(headEpoch, activeIndices, base),
+          fetchProposerDuties(headEpoch + 1, activeIndices, base),
+        ]).then(([cur, nxt]) => [...cur, ...nxt])
+      : Promise.resolve([] as ProposerDuty[]),
+  ]);
+
+  process.stdout.write(chalk.gray(" done\n\n"));
+
+  // ── Summary stats ──────────────────────────────────────────────────────────
+  const totalValidators = validators.length;
+  const activeCount = activeIndices.length;
+  const slashedCount = validators.filter(v => v.validator.slashed).length;
+  const nonActiveCount = validators.filter(v => !v.status.startsWith("active")).length;
+  const totalBalEth = (validators.reduce((s, v) => s + Number(v.balance), 0) / 1e9).toFixed(4);
+
+  // Missed attestations
+  const missedIndices = [...missedMap.entries()]
+    .filter(([, attested]) => !attested)
+    .map(([idx]) => idx);
+  const missedCount = missedIndices.length;
+  const attestedCount = activeIndices.length - missedCount;
+
+  // Upcoming proposals
+  const proposerSlots = new Map<number, number[]>();
+  for (const pd of proposerDuties) {
+    const slots = proposerSlots.get(pd.validator_index) ?? [];
+    slots.push(pd.slot);
+    proposerSlots.set(pd.validator_index, slots);
+  }
+  const upcomingProposals = proposerDuties.filter(d => d.slot > headSlot);
+
+  // Finality gap
+  const finalityGap = finalizedEpoch > 0 ? headEpoch - finalizedEpoch : 0;
+  const finalityOk = finalityGap <= 3;
+
+  // ── Terminal output ────────────────────────────────────────────────────────
+  const healthOk = slashedCount === 0 && nonActiveCount === 0 && missedCount === 0 && finalityOk;
+  const headerColor = healthOk ? chalk.green : chalk.red;
+
+  console.log(chalk.bold("  val-monitor report"));
+  console.log(chalk.gray(`  ${tsLabel} | Beacon: ${base}`));
+  console.log(chalk.gray(`  Head: epoch ${headEpoch} (slot ${headSlot}) | Finalized: epoch ${finalizedEpoch}`));
+  console.log();
+
+  const overallStatus = healthOk
+    ? chalk.green("✓ All healthy")
+    : chalk.red("⚠  Issues detected");
+
+  console.log(`  Status:     ${overallStatus}`);
+  console.log(`  Validators: ${activeCount}/${totalValidators} active  |  ${totalBalEth} ETH total`);
+  console.log(`  Finality:   ${finalityOk ? chalk.green(`gap ${finalityGap} epochs`) : chalk.red(`gap ${finalityGap} epochs — WARN`)}`);
+  console.log();
+
+  // Attestation summary
+  const attLabel = missedCount === 0
+    ? chalk.green(`${attestedCount}/${activeIndices.length} attested last epoch (${lastEpoch})`)
+    : chalk.red(`MISSED ${missedCount} — validators: ${missedIndices.join(", ")}`);
+  console.log(`  Attestations (ep ${lastEpoch}): ${attLabel}`);
+
+  // Slashing
+  if (slashedCount > 0) {
+    const slashedIdxs = validators.filter(v => v.validator.slashed).map(v => v.index);
+    console.log(chalk.red(`  Slashed:    ${slashedCount} — validators: ${slashedIdxs.join(", ")}`));
+  }
+
+  // Non-active
+  if (nonActiveCount > 0) {
+    const statusGroups = new Map<string, number[]>();
+    for (const v of validators.filter(v => !v.status.startsWith("active"))) {
+      const arr = statusGroups.get(v.status) ?? [];
+      arr.push(Number(v.index));
+      statusGroups.set(v.status, arr);
+    }
+    for (const [status, idxs] of statusGroups) {
+      console.log(chalk.yellow(`  ${status}: validators ${idxs.join(", ")}`));
+    }
+  }
+
+  // Upcoming proposals
+  if (upcomingProposals.length > 0) {
+    const propLines = upcomingProposals.map(pd => `val ${pd.validator_index} @ slot ${pd.slot}`);
+    console.log(chalk.magenta(`  Proposals:  ${propLines.join("  |  ")}`));
+  } else {
+    console.log(chalk.gray("  Proposals:  none scheduled this epoch"));
+  }
+
+  console.log();
+
+  // Per-validator table
+  console.log(chalk.bold("  Per-Validator Detail"));
+  console.log("  " + chalk.bold("Index".padEnd(10) + "  " + "Status".padEnd(22) + "  " + "Balance ETH".padEnd(14) + "  " + "Att ep " + lastEpoch));
+  console.log("  " + "─".repeat(72));
+
+  for (const v of validators.sort((a, b) => Number(a.index) - Number(b.index))) {
+    const idx = Number(v.index);
+    const statusStr = v.status + (v.validator.slashed ? " SLASHED" : "");
+    const statusFmt = statusBadge(v.status) + (v.validator.slashed ? chalk.red(" SLASHED") : "");
+    const statusPad = " ".repeat(Math.max(0, 22 - statusStr.length));
+    const attResult = missedMap.has(idx)
+      ? (missedMap.get(idx) ? chalk.green("✓") : chalk.red("✗ MISSED"))
+      : chalk.gray("n/a");
+
+    console.log(
+      "  " +
+      String(idx).padEnd(10) + "  " +
+      statusFmt + statusPad + "  " +
+      gweiToEth(v.balance).padEnd(14) + "  " +
+      attResult
+    );
+  }
+  console.log();
+
+  // ── Discord webhook ────────────────────────────────────────────────────────
+  if (!webhook) {
+    console.log(chalk.gray("  (No webhook configured — set with `val-monitor set webhook <url>`)"));
+    return;
+  }
+
+  // Build Discord embed
+  const embedColor = healthOk ? 0x2ecc71 : (slashedCount > 0 || missedCount > 0) ? 0xe74c3c : 0xf39c12;
+
+  const valRows = validators
+    .sort((a, b) => Number(a.index) - Number(b.index))
+    .map(v => {
+      const idx = Number(v.index);
+      const att = missedMap.has(idx)
+        ? (missedMap.get(idx) ? "✅" : "❌")
+        : "—";
+      const slashFlag = v.validator.slashed ? " 🚨" : "";
+      const bal = gweiToEth(v.balance);
+      return `\`${String(idx).padEnd(8)}\` ${att} ${bal} ETH  ${v.status}${slashFlag}`;
+    })
+    .join("\n");
+
+  const attSummary = missedCount === 0
+    ? `✅ All ${activeIndices.length} attested`
+    : `❌ ${missedCount} missed: ${missedIndices.join(", ")}`;
+
+  const proposalSummary = upcomingProposals.length > 0
+    ? upcomingProposals.map(pd => `val ${pd.validator_index} @ slot ${pd.slot}`).join(", ")
+    : "None scheduled";
+
+  const finalitySummary = finalityOk
+    ? `✅ Epoch ${finalizedEpoch} (gap: ${finalityGap})`
+    : `⚠️ Epoch ${finalizedEpoch} — gap ${finalityGap} epochs`;
+
+  const embed: DiscordEmbed = {
+    title: healthOk ? "✅ val-monitor — All Healthy" : "⚠️ val-monitor — Issues Detected",
+    color: embedColor,
+    timestamp: ts.toISOString(),
+    fields: [
+      {
+        name: "Network",
+        value: [
+          `Head: epoch \`${headEpoch}\` / slot \`${headSlot}\``,
+          `Finality: ${finalitySummary}`,
+        ].join("\n"),
+        inline: false,
+      },
+      {
+        name: `Validators (${activeCount}/${totalValidators} active)`,
+        value: valRows || "No validators",
+        inline: false,
+      },
+      {
+        name: `Attestations — Epoch ${lastEpoch}`,
+        value: attSummary,
+        inline: true,
+      },
+      {
+        name: "Upcoming Proposals",
+        value: proposalSummary,
+        inline: true,
+      },
+      {
+        name: "Total Balance",
+        value: `${totalBalEth} ETH`,
+        inline: true,
+      },
+    ],
+  };
+
+  await sendWebhook(webhook, "", [embed]);
+  console.log(chalk.green("  ✓ Report posted to Discord webhook."));
+  console.log();
+}
+
 // ── Prometheus metrics ────────────────────────────────────────────────────────
 
 /**
@@ -1590,7 +1835,7 @@ const program = new Command();
 program
   .name("val-monitor")
   .description("Ethereum validator health monitor")
-  .version("1.6.0")
+  .version("1.7.0")
   .option("-c, --config <path>", "config file path", DEFAULT_CONFIG_PATH);
 
 program
@@ -1703,6 +1948,16 @@ program
   .action(async () => {
     const parent = program.opts();
     await cmdPeers({ config: parent.config ?? DEFAULT_CONFIG_PATH });
+  });
+
+program
+  .command("report")
+  .description("Single-shot health report: status + missed attestations + proposals. Posts to Discord webhook if configured.")
+  .option("--webhook <url>", "Discord webhook URL for report delivery (overrides config)")
+  .option("-i, --index <indices...>", "validator indices (ad-hoc, not saved)")
+  .action(async (opts) => {
+    const parent = program.opts();
+    await cmdReport({ ...opts, config: parent.config ?? DEFAULT_CONFIG_PATH });
   });
 
 program.parse();
